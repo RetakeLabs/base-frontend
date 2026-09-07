@@ -16,6 +16,8 @@ Boilerplate fundacional para novos projetos: Next.js (App Router) + React + Type
 - **TanStack Query** para cache/estado de servidor
 - **Sonner** para toasts globais (por trás do `toast()` já existente — ver abaixo)
 - `clsx` + `tailwind-merge` (utilitário `cn`) para composição segura de classes
+- **Vitest** + **React Testing Library** para testes unitários/componente (ver "Testes" abaixo)
+- **GitHub Actions** rodando lint + typecheck + testes + build em todo push/PR (`.github/workflows/ci.yml`)
 
 ## Estrutura de pastas
 
@@ -23,10 +25,16 @@ Boilerplate fundacional para novos projetos: Next.js (App Router) + React + Type
 src/
   app/
     layout.tsx        # Root layout, ThemeProvider, Toaster, fontes, metadata
-    page.tsx           # Showcase — catálogo dos componentes
+    page.tsx           # Showcase — catálogo dos componentes ("use client": página inteira é demo interativa)
+    error.tsx           # Error boundary raiz (Client Component — exigência do Next)
+    not-found.tsx        # 404 raiz — Server Component (conteúdo estático, sem JS extra)
     globals.css        # Tema: variáveis CSS (light + .dark) + bridge para o Tailwind
     login/page.tsx      # Tela de login (form + validação visual + toast)
-    dashboard/page.tsx  # Exemplo de rota usando o DashboardLayout
+    dashboard/
+      page.tsx             # Server Component: busca os dados no servidor (getDashboardData) e monta a página
+      customers-panel.tsx  # Client island: tabela de clientes (sort/CSV/toast) — só essa parte precisa de JS
+      error.tsx             # Error boundary da rota /dashboard
+      loading.tsx           # Suspense fallback automático enquanto o Server Component busca dados
   components/
     ui/                 # Componentes de interface, sem lógica de negócio
       button.tsx
@@ -68,18 +76,33 @@ src/
     query-provider.tsx    # Wrapper client do QueryClientProvider (TanStack Query)
   lib/
     utils.ts             # cn() — merge de classes Tailwind
+    env.ts                 # process.env validado com Zod — falha no boot, não dentro de um fetch()
     api.ts                # Client HTTP base — ponto único de injeção do Bearer token
+    dashboard-data.ts       # getDashboardData() — fetch server-only consumido por dashboard/page.tsx
     use-presence.ts       # hook de entrada/saída animada (Modal, Toast, Dropdown, DatePicker, Drawer)
     use-has-mounted.ts    # hook para evitar mismatch de hidratação (SSR-safe)
     use-object-url.ts      # useObjectUrl(file) — preview de imagem com createObjectURL + revoke automático
     use-data.ts            # useQuery de exemplo (useData) — troque o mock por api.get(...)
     export-csv.ts          # exportToCsv() usado pelo botão "Exportar CSV" da DataTable
   proxy.ts                 # Proteção de rota (ver seção "Autenticação" abaixo)
+vitest.config.mts           # Config do Vitest (jsdom + tsconfig paths)
+.github/workflows/ci.yml    # lint + typecheck + testes + build em todo push/PR
 ```
 
 Quando adicionar uma feature com lógica de negócio (chamadas de API, hooks de domínio, etc.), crie pastas irmãs de `components/ui`, por exemplo `src/features/<nome>` ou `src/services`, mantendo `components/ui` livre de qualquer regra de negócio.
 
-Todo componente em `components/ui` é independente, declara `"use client"` quando há interatividade e exporta uma interface de props própria estendendo o tipo HTML nativo correspondente (ex. `ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement>`).
+Todo componente em `components/ui` é independente e exporta uma interface de props própria estendendo o tipo HTML nativo correspondente (ex. `ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement>`). `"use client"` é declarado **só** quando o componente de fato precisa: hook de estado/efeito, evento (`onClick`/`onChange`), API de browser, ou uma lib client-only (recharts, sonner). Componentes puramente visuais (`Card`, `Badge`, `MetricCard`, `Brand`, `Breadcrumb`, `Stepper`, `Tooltip`, `Skeleton`, `LoadingSpinner`) não têm a diretiva — funcionam tanto renderizados no servidor quanto importados por uma árvore client, sem custo de bundle extra no primeiro caso.
+
+## Server vs. Client Components
+
+O App Router só compensa se a maior parte da árvore for Server Component — é isso que corta o JS enviado ao browser e permite `fetch` direto no servidor, sem cliente de cache nem loading state pra dado inicial. A regra desta base:
+
+- **Página busca dado, ilha interage.** `src/app/dashboard/page.tsx` é `async` e Server Component: chama `getDashboardData()` (`src/lib/dashboard-data.ts`) direto, sem `useQuery`/`useEffect`, e passa o resultado como prop pros filhos. Só o pedaço que precisa de JS no browser — `DashboardCustomersPanel` (sort, exportar CSV, toast ao editar/excluir) e `DashboardChart` (recharts) — é `"use client"`; o resto (`DashboardLayout` por fora, `MetricCard`/`Card` por dentro) não manda bundle extra.
+- **Função não atravessa a fronteira Server → Client.** Um Server Component não pode passar uma referência de função (incluindo um ícone do `lucide-react`, que é um componente `forwardRef`) como prop pra um Client Component — só dado serializável. Por isso `src/app/not-found.tsx` é Server Component "de verdade" (markup próprio, sem usar o `EmptyState` client) em vez de repassar `icon={FileQuestion}` pra um componente client.
+- **`error.tsx` é sempre Client Component** — exigência do Next: error boundary usa o equivalente de `componentDidCatch`, que só existe no cliente. `not-found.tsx` não tem essa exigência e fica Server sempre que o conteúdo é estático.
+- **TanStack Query é para depois da carga inicial** — refetch, mutação, invalidação de cache após uma ação do usuário (`useData`, em `src/lib/use-data.ts`, é esse caso: dado que o usuário pode re-disparar). Dado que a página só precisa mostrar ao abrir vai direto num Server Component, sem passar por `useQuery`.
+
+Ao adicionar uma rota nova, comece sem `"use client"` na página; só desça a diretiva pro componente-filho específico que realmente precisa de interatividade.
 
 ## Sistema de temas (Light/Dark)
 
@@ -148,7 +171,20 @@ Portalizado para `document.body` e posicionado via `getBoundingClientRect` (não
 
 ## Variáveis de ambiente
 
-Copie `.env.example` para `.env.local` e ajuste `NEXT_PUBLIC_API_URL` (lido em `src/lib/api.ts` como base URL do client HTTP).
+Copie `.env.example` para `.env.local` e ajuste `NEXT_PUBLIC_API_URL`. A leitura passa por `src/lib/env.ts`, que valida `process.env` com Zod **no momento em que o módulo é importado**: uma env faltando ou mal formada derruba o boot com uma mensagem clara, em vez de quebrar silenciosamente dentro de um `fetch()` no meio de uma request. `src/lib/api.ts` importa `env` de lá — para adicionar uma nova variável, acrescente-a ao `envSchema` em `env.ts` e leia via `env.NOME_DA_VAR`, nunca `process.env` direto no resto do código.
+
+## Testes
+
+Vitest + React Testing Library, configurados em `vitest.config.mts` (jsdom + resolução de `@/*`). Cobrem hooks/utils puros (`src/lib/utils.test.ts`) e componentes síncronos (`src/components/ui/badge.test.tsx`) — Server Components `async` (como `dashboard/page.tsx`) não são testáveis por unit test hoje (limitação do próprio Vitest/RSC); cubra esses com E2E se precisar.
+
+```bash
+npm run test      # watch mode, para desenvolvimento
+npm run test:ci    # roda uma vez e sai — usado no CI
+```
+
+## CI
+
+`.github/workflows/ci.yml` roda em todo push/PR: `lint` → `typecheck` → `test:ci` → `build`, nessa ordem, falhando rápido no passo mais barato primeiro.
 
 ## Autenticação e proteção de rotas
 
@@ -193,6 +229,7 @@ Isso é suficiente para eu (Claude) saber exatamente onde estão as variáveis d
 npm run dev
 npm run build
 npm run lint
+npm run typecheck
+npm run test        # watch mode
+npm run test:ci      # roda uma vez (CI)
 ```
-#   b a s e - f r o n t e n d  
- 
